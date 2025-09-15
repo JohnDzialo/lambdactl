@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Remote Executor Module
+Remote Executor Module v2 - Separated Architecture
 
 This module provides SSH-based remote execution capabilities for deploying and running
-GPU load tests on Lambda Labs instances. It handles:
+GPU load tests with separate resource monitoring on Lambda Labs instances. It handles:
 - SSH connection management
-- File transfer (SCP)
-- Remote command execution
-- Result collection
+- File transfer (SCP) for both GPU test and monitoring scripts
+- Coordinated execution of GPU tests and background monitoring
+- Result collection from both processes
 - Error handling and retries
 
 Uses paramiko for SSH operations with pydantic models.
+Features separated GPU testing and resource monitoring for optimal performance.
 """
 
 import json
@@ -36,6 +37,15 @@ class ConnectionConfig(BaseModel):
     timeout: int = 30
     retry_attempts: int = 3
     retry_delay: float = 5.0
+
+
+class MonitoringConfig(BaseModel):
+    """Configuration for resource monitoring"""
+    
+    enabled: bool = True
+    interval_seconds: float = 60.0
+    duration_buffer_seconds: float = 300.0  # Extra time to monitor after test completes
+    metrics: List[str] = ["cpu", "memory", "gpu", "network", "disk"]
 
 
 class RemoteExecutionResult(BaseModel):
@@ -67,11 +77,13 @@ class LoadTestResult(BaseModel):
     success: bool
     execution_time: float
     local_results_file: Optional[str] = None
+    local_monitoring_file: Optional[str] = None
     error: Optional[str] = None
     stdout: Optional[str] = None
     stage: Optional[str] = None
     total_workflow_time: Optional[float] = None
     test_results: Optional[Dict[str, Any]] = None
+    monitoring_results: Optional[Dict[str, Any]] = None
 
 
 class AggregatedResults(BaseModel):
@@ -300,15 +312,15 @@ class SSHConnection:
 
 
 class RemoteLoadTestExecutor:
-    """High-level executor for running GPU load tests on remote instances"""
+    """High-level executor for running GPU load tests with separate resource monitoring"""
 
-    def __init__(self, ssh_key_file: str):
+    def __init__(self, ssh_key_file: str, monitoring_config: MonitoringConfig = None):
         self.ssh_key_file = ssh_key_file
+        self.monitoring_config = monitoring_config or MonitoringConfig()
         self.logger = logging.getLogger(__name__)
 
     def setup_instance(self, hostname: str, username: str = "ubuntu") -> bool:
         """Setup instance with required dependencies"""
-        print(self.ssh_key_file)
         config = ConnectionConfig(
             hostname=hostname, username=username, key_file=self.ssh_key_file
         )
@@ -352,8 +364,8 @@ class RemoteLoadTestExecutor:
                 )
                 return True  # Continue anyway for CPU testing
 
-    def deploy_load_test_script(self, hostname: str, username: str = "ubuntu") -> bool:
-        """Deploy load test script to remote instance"""
+    def deploy_scripts(self, hostname: str, username: str = "ubuntu") -> bool:
+        """Deploy both GPU load test and resource monitoring scripts to remote instance"""
         config = ConnectionConfig(
             hostname=hostname, username=username, key_file=self.ssh_key_file
         )
@@ -362,23 +374,31 @@ class RemoteLoadTestExecutor:
             if not conn.client:
                 return False
 
-            self.logger.info(f"Deploying load test script to {hostname}")
+            self.logger.info(f"Deploying scripts to {hostname}")
 
-            # Upload the load test script
-            local_script = Path(__file__).parent / "load_tests" / "gpu_loadtest.py"
-            remote_script = "/tmp/gpu_loadtest.py"
+            # Upload the pure GPU load test script
+            local_gpu_script = Path(__file__).parent / "load_tests" / "gpu_loadtest.py"
+            remote_gpu_script = "/tmp/gpu_loadtest.py"
 
-            result = conn.upload_file_via_ssh(local_script, remote_script)
+            result = conn.upload_file_via_ssh(local_gpu_script, remote_gpu_script)
             if not result.success:
-                self.logger.error(f"Failed to upload script: {result.error_message}")
+                self.logger.error(f"Failed to upload GPU test script: {result.error_message}")
                 return False
 
-            # Make script executable
-            result = conn.execute_command(f"chmod +x {remote_script}", timeout=30)
+            # Upload the resource monitoring script
+            local_monitor_script = Path(__file__).parent / "load_tests" / "resource_monitor.py"
+            remote_monitor_script = "/tmp/resource_monitor.py"
+
+            result = conn.upload_file_via_ssh(local_monitor_script, remote_monitor_script)
             if not result.success:
-                self.logger.warning(
-                    f"Failed to make script executable: {result.stderr}"
-                )
+                self.logger.error(f"Failed to upload monitoring script: {result.error_message}")
+                return False
+
+            # Make scripts executable
+            for script in [remote_gpu_script, remote_monitor_script]:
+                result = conn.execute_command(f"chmod +x {script}", timeout=30)
+                if not result.success:
+                    self.logger.warning(f"Failed to make {script} executable: {result.stderr}")
 
             return True
 
@@ -388,12 +408,8 @@ class RemoteLoadTestExecutor:
         output_file: str = None,
         username: str = "ubuntu",
         quick: bool = False,
-        num_epochs: int = 3,
-        num_batches: int = 200,
-        num_workers: int = 0,
-        metrics_sample_rate: float = 5.0,
     ) -> LoadTestResult:
-        """Run load test on remote instance and collect results"""
+        """Run load test and monitoring on remote instance and collect results"""
         config = ConnectionConfig(
             hostname=hostname, username=username, key_file=self.ssh_key_file
         )
@@ -407,33 +423,62 @@ class RemoteLoadTestExecutor:
                     error="Failed to connect to instance",
                 )
 
-            self.logger.info(f"Running load test on {hostname}")
+            self.logger.info(f"Running load test and monitoring on {hostname}")
 
-            # Prepare command
-            remote_script = "/tmp/gpu_loadtest.py"
-            remote_output = (
-                output_file or f"/tmp/gpu_loadtest_results_{int(time.time())}.json"
-            )
+            # Prepare file paths
+            timestamp = int(time.time())
+            remote_gpu_script = "/tmp/gpu_loadtest.py"
+            remote_monitor_script = "/tmp/resource_monitor.py"
+            remote_gpu_output = output_file or f"/tmp/gpu_loadtest_results_{timestamp}.json"
+            remote_monitor_output = f"/tmp/resource_monitor_{timestamp}.json"
+            remote_gpu_log = f"/tmp/gpu_loadtest_log_{timestamp}.log"
 
-            cmd_args = ["python3", remote_script, "--output", remote_output]
-            cmd_args.extend(["--num-epochs", str(num_epochs)])
-            cmd_args.extend(["--num-batches", str(num_batches)])
-            cmd_args.extend(["--num-workers", str(num_workers)])
-
+            # Prepare GPU test command
+            gpu_cmd_args = ["python3", remote_gpu_script, "--output", remote_gpu_output]
             if quick:
-                cmd_args.append("--quick")
+                gpu_cmd_args.append("--quick")
+            gpu_cmd_args.extend(["--log-file", remote_gpu_log])
+            gpu_command = " ".join(gpu_cmd_args)
 
-            # Add log file for remote logging
-            remote_log = f"/tmp/gpu_loadtest_log_{int(time.time())}.log"
-            cmd_args.extend(["--log-file", remote_log])
+            # Start resource monitoring if enabled
+            monitor_pid = None
+            if self.monitoring_config.enabled:
+                self.logger.info(f"Starting resource monitoring (interval: {self.monitoring_config.interval_seconds}s)")
+                
+                # Estimate test duration for monitoring
+                estimated_test_duration = 1800 if not quick else 300  # 30 min full, 5 min quick
+                monitor_duration = estimated_test_duration + self.monitoring_config.duration_buffer_seconds
+                
+                monitor_cmd_args = [
+                    "python3", remote_monitor_script,
+                    "--interval", str(self.monitoring_config.interval_seconds),
+                    "--duration", str(monitor_duration),
+                    "--output", remote_monitor_output,
+                    "--quiet"
+                ]
+                monitor_command = " ".join(monitor_cmd_args)
+                
+                # Start monitoring in background
+                bg_monitor_command = f"nohup {monitor_command} > /tmp/monitor_{timestamp}.out 2>&1 & echo $!"
+                monitor_result = conn.execute_command(bg_monitor_command, timeout=30)
+                
+                if monitor_result.success and monitor_result.stdout.strip():
+                    monitor_pid = monitor_result.stdout.strip()
+                    self.logger.info(f"Resource monitoring started with PID: {monitor_pid}")
+                    time.sleep(2)  # Brief delay to let monitoring start
+                else:
+                    self.logger.warning(f"Failed to start resource monitoring: {monitor_result.stderr}")
 
-            # Add metrics sample rate
-            cmd_args.extend(["--metrics-sample-rate", str(metrics_sample_rate)])
+            # Execute GPU load test
+            self.logger.info(f"Starting GPU load test: {gpu_command}")
+            result = conn.execute_command(gpu_command, timeout=3600)  # 1 hour timeout
 
-            command = " ".join(cmd_args)
-
-            # Execute load test
-            result = conn.execute_command(command, timeout=3600)  # 1 hour timeout
+            # Stop monitoring if it was started
+            if monitor_pid and self.monitoring_config.enabled:
+                self.logger.info("Stopping resource monitoring")
+                stop_cmd = f"kill {monitor_pid} 2>/dev/null || true"
+                conn.execute_command(stop_cmd, timeout=30)
+                time.sleep(2)  # Give monitoring time to save results
 
             if not result.success:
                 self.logger.error(f"Load test failed on {hostname}: {result.stderr}")
@@ -446,25 +491,44 @@ class RemoteLoadTestExecutor:
                     stage="execute",
                 )
 
-            # Download results
-            local_output = Path(f"results_{hostname}_{int(time.time())}.json")
-            download_result = conn.download_file_via_ssh(remote_output, local_output)
+            # Download GPU test results
+            local_gpu_output = Path(f"results_{hostname}_{timestamp}.json")
+            gpu_download_result = conn.download_file_via_ssh(remote_gpu_output, local_gpu_output)
 
-            if not download_result.success:
+            if not gpu_download_result.success:
                 self.logger.error(
-                    f"Failed to download results from {hostname}: {download_result.error_message}"
+                    f"Failed to download GPU test results from {hostname}: {gpu_download_result.error_message}"
                 )
                 return LoadTestResult(
                     hostname=hostname,
                     success=False,
                     execution_time=result.execution_time,
-                    error=f"Failed to download results: {download_result.error_message}",
+                    error=f"Failed to download GPU test results: {gpu_download_result.error_message}",
                     stage="download",
                 )
 
-            # Parse results
+            # Download monitoring results if enabled
+            local_monitor_output = None
+            monitoring_results = None
+            if self.monitoring_config.enabled:
+                local_monitor_output = Path(f"monitoring_{hostname}_{timestamp}.json")
+                monitor_download_result = conn.download_file_via_ssh(remote_monitor_output, local_monitor_output)
+                
+                if monitor_download_result.success:
+                    try:
+                        with open(local_monitor_output, "r") as f:
+                            monitoring_results = json.load(f)
+                        self.logger.info(f"Downloaded monitoring results from {hostname}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to parse monitoring results: {e}")
+                        local_monitor_output = None
+                else:
+                    self.logger.warning(f"Failed to download monitoring results: {monitor_download_result.error_message}")
+                    local_monitor_output = None
+
+            # Parse GPU test results
             try:
-                with open(local_output, "r") as f:
+                with open(local_gpu_output, "r") as f:
                     test_results = json.load(f)
 
                 self.logger.info(f"Load test completed successfully on {hostname}")
@@ -472,17 +536,19 @@ class RemoteLoadTestExecutor:
                     hostname=hostname,
                     success=True,
                     execution_time=result.execution_time,
-                    local_results_file=str(local_output),
+                    local_results_file=str(local_gpu_output),
+                    local_monitoring_file=str(local_monitor_output) if local_monitor_output else None,
                     test_results=test_results,
+                    monitoring_results=monitoring_results,
                 )
 
             except Exception as e:
-                self.logger.error(f"Failed to parse results from {hostname}: {e}")
+                self.logger.error(f"Failed to parse GPU test results from {hostname}: {e}")
                 return LoadTestResult(
                     hostname=hostname,
                     success=False,
                     execution_time=result.execution_time,
-                    error=f"Failed to parse results: {e}",
+                    error=f"Failed to parse GPU test results: {e}",
                     stage="parse",
                 )
 
@@ -491,10 +557,6 @@ class RemoteLoadTestExecutor:
         hostnames: List[str],
         username: str = "ubuntu",
         quick: bool = False,
-        num_epochs: int = 3,
-        num_batches: int = 200,
-        num_workers: int = 0,
-        metrics_sample_rate: float = 5.0,
         max_workers: int = 5,
     ) -> List[LoadTestResult]:
         """Run load tests on multiple instances in parallel"""
@@ -511,10 +573,6 @@ class RemoteLoadTestExecutor:
                     hostname,
                     username,
                     quick,
-                    num_epochs,
-                    num_batches,
-                    num_workers,
-                    metrics_sample_rate,
                 )
                 future_to_hostname[future] = hostname
 
@@ -543,10 +601,6 @@ class RemoteLoadTestExecutor:
         hostname: str,
         username: str = "ubuntu",
         quick: bool = False,
-        num_epochs: int = 3,
-        num_batches: int = 200,
-        num_workers: int = 0,
-        metrics_sample_rate: float = 5.0,
     ) -> LoadTestResult:
         """Run complete test workflow: setup, deploy, run, collect"""
         start_time = time.time()
@@ -563,14 +617,14 @@ class RemoteLoadTestExecutor:
                     stage="setup",
                 )
 
-            # Deploy script
-            deploy_success = self.deploy_load_test_script(hostname, username)
+            # Deploy scripts
+            deploy_success = self.deploy_scripts(hostname, username)
             if not deploy_success:
                 return LoadTestResult(
                     hostname=hostname,
                     success=False,
                     execution_time=0,
-                    error="Failed to deploy script",
+                    error="Failed to deploy scripts",
                     stage="deploy",
                 )
 
@@ -579,10 +633,6 @@ class RemoteLoadTestExecutor:
                 hostname,
                 username=username,
                 quick=quick,
-                num_epochs=num_epochs,
-                num_batches=num_batches,
-                num_workers=num_workers,
-                metrics_sample_rate=metrics_sample_rate,
             )
 
             total_time = time.time() - start_time
@@ -611,6 +661,8 @@ class RemoteLoadTestExecutor:
             "successful_instances": len(successful_results),
             "failed_instances": len(failed_results),
             "success_rate": len(successful_results) / len(results) if results else 0,
+            "monitoring_enabled": self.monitoring_config.enabled,
+            "monitoring_interval_seconds": self.monitoring_config.interval_seconds,
             "timestamp": time.time(),
         }
 

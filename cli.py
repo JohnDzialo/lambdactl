@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import click
 
 from lambda_api import LambdaLabsAPI, Instance, InstanceRequest
-from remote_executor import RemoteLoadTestExecutor
+from remote_executor import RemoteLoadTestExecutor, MonitoringConfig
 
 
 # Global configuration
@@ -404,22 +404,14 @@ def test():
 @click.option("--username", default="ubuntu", help="SSH username for instances")
 @click.option("--quick", is_flag=True, help="Run quick GPU load tests")
 @click.option(
-    "--num-epochs", default=3, help="Number of epochs for training tests (default: 3)"
+    "--monitoring/--no-monitoring",
+    default=True,
+    help="Enable/disable resource monitoring (default: enabled)",
 )
 @click.option(
-    "--num-batches",
-    default=200,
-    help="Number of batches for inference tests (default: 200)",
-)
-@click.option(
-    "--num-workers",
-    default=0,
-    help="Number of worker threads for data loading (default: 4)",
-)
-@click.option(
-    "--metrics-sample-rate",
-    default=5.0,
-    help="Resource monitoring sample rate in seconds (default: 5.0)",
+    "--monitoring-interval",
+    default=60.0,
+    help="Resource monitoring interval in seconds (default: 60.0)",
 )
 @click.option("--max-workers", default=5, help="Maximum parallel workers")
 @click.option("--output", help="Output file for aggregated results")
@@ -431,10 +423,8 @@ def load(
     ssh_key,
     username,
     quick,
-    num_epochs,
-    num_batches,
-    num_workers,
-    metrics_sample_rate,
+    monitoring,
+    monitoring_interval,
     max_workers,
     output,
 ):
@@ -500,19 +490,22 @@ def load(
     logger.info(f"Running GPU load tests on {len(hostnames)} instances")
     click.echo(f"Starting GPU load tests on {len(hostnames)} instances...")
 
-    # Create remote executor
+    # Create remote executor with monitoring config
     try:
-        executor = RemoteLoadTestExecutor(ssh_key)
+        monitoring_config = MonitoringConfig(
+            enabled=monitoring,
+            interval_seconds=monitoring_interval,
+            duration_buffer_seconds=300.0,
+            metrics=["cpu", "memory", "gpu", "network", "disk"]
+        )
+        
+        executor = RemoteLoadTestExecutor(ssh_key, monitoring_config=monitoring_config)
 
         # Run parallel load tests
         results = executor.run_parallel_load_tests(
             hostnames=hostnames,
             username=username,
             quick=quick,
-            num_epochs=num_epochs,
-            num_batches=num_batches,
-            num_workers=num_workers,
-            metrics_sample_rate=metrics_sample_rate,
             max_workers=max_workers,
         )
 
@@ -535,6 +528,10 @@ def load(
         click.echo(f"Successful tests: {summary['successful_instances']}")
         click.echo(f"Failed tests: {summary['failed_instances']}")
         click.echo(f"Success rate: {summary['success_rate']:.1%}")
+        if monitoring:
+            click.echo(f"Monitoring enabled: Yes (interval: {monitoring_interval}s)")
+        else:
+            click.echo(f"Monitoring enabled: No")
 
         if aggregated.performance_summary:
             perf = aggregated.performance_summary
@@ -558,6 +555,32 @@ def load(
                 click.echo(
                     f"Inference max throughput: {inference['max_throughput']:.1f} samples/sec"
                 )
+
+        # Display resource monitoring summary if available
+        if monitoring and aggregated.successful_results:
+            monitoring_results = [r for r in aggregated.successful_results if r.monitoring_results]
+            if monitoring_results:
+                click.echo(f"\nResource Monitoring Summary:")
+                for result in monitoring_results:
+                    if result.monitoring_results and "snapshots" in result.monitoring_results:
+                        snapshots = result.monitoring_results["snapshots"]
+                        duration = result.monitoring_results.get("duration_seconds", 0)
+                        
+                        if snapshots:
+                            # Calculate averages from snapshots
+                            avg_cpu = sum(s.get("cpu_percent", 0) for s in snapshots) / len(snapshots)
+                            avg_memory = sum(s.get("memory_percent", 0) for s in snapshots) / len(snapshots)
+                            
+                            # Get GPU utilization (first GPU as representative)
+                            gpu_utils = []
+                            for snapshot in snapshots:
+                                if snapshot.get("gpu_metrics") and len(snapshot["gpu_metrics"]) > 0:
+                                    gpu_utils.append(snapshot["gpu_metrics"][0].get("utilization_percent", 0))
+                            
+                            avg_gpu = sum(gpu_utils) / len(gpu_utils) if gpu_utils else 0
+                            
+                            click.echo(f"  {result.hostname}: {len(snapshots)} samples over {duration:.1f}s")
+                            click.echo(f"    CPU: {avg_cpu:.1f}%, Memory: {avg_memory:.1f}%, GPU: {avg_gpu:.1f}%")
 
         if aggregated.failed_results:
             click.echo(f"\nFailed instances:")
